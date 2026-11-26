@@ -24,3 +24,7 @@ irm "https://raw.githubusercontent.com/drmendel/wol/main/fix" | iex
 
 - **Administrator privileges:** Required to query/modify `root\wmi` power classes, `powercfg`, and adapter properties.
 - **S5 (Shutdown) WoL:** Requires Fast Startup to be disabled in Windows, plus **Wake on LAN / Power On By PCI-E** enabled (and **ErP** disabled) in your motherboard's UEFI/BIOS.
+
+## Still not waking?
+
+Follow the full [Troubleshooting Checklist](CHECKLIST.md): BIOS, Windows, NIC, physical checks, a Raspberry Pi isolation test, and switch/router settings for the network admin.

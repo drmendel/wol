@@ -1,0 +1,126 @@
+# Wake-on-LAN Troubleshooting Checklist
+
+Work through it top to bottom. Each section narrows down **where** the problem is: the PC, the switch port, or the routing between subnets.
+
+---
+
+## 0. Know the symptom
+
+| Symptom | Most likely area |
+|---|---|
+| Wakes if sent 1–2 min after shutdown, fails later | Switch MAC table / router ARP aging (§6–§7), or NIC losing power (§1, §4) |
+| Never wakes from shutdown, wakes from sleep | Fast Startup or BIOS S5 settings (§1, §2) |
+| Network LED goes dark after shutdown | NIC unpowered: BIOS ErP / Deep Sleep (§1) |
+| Works over a direct cable, fails on the corporate network | Switch port: 802.1X, speed, EEE, storm control (§7) |
+| Works on the same VLAN, fails from another subnet | Expected; needs a relay, static ARP or directed broadcast (§8) |
+
+---
+
+## 1. BIOS / UEFI
+
+- [ ] **Wake on LAN** / **Power On By PCI-E** / **Resume by Onboard LAN** → `Enabled`
+- [ ] WoL mode is **not** "Disabled in S5" or "Sleep only" (should be "LAN" or "LAN with PXE boot")
+- [ ] **ErP / EuP** → `Disabled`
+- [ ] **Deep Sleep** (Dell: *Deep Sleep Control*) → `Disabled`
+- [ ] **Fast Boot** / **Ultra Fast Boot** → `Disabled` (at least while testing)
+- [ ] **AC Recovery** set as desired (not WoL-related, but avoids confusion after power cuts)
+- [ ] Saved and exited (F10), then one **full** power-on
+
+## 2. Windows power settings
+
+Run [`check`](check) (read-only) and [`fix`](fix) (interactive) from an **admin PowerShell**, see [README](README.md).
+
+- [ ] **Fast Startup** off: Control Panel → Power Options → *Choose what the power buttons do*
+- [ ] Hibernation off (`powercfg /h off`) if you don't need it
+- [ ] NIC appears in `powercfg /devicequery wake_armed`
+- [ ] Shutdown done via **Start → Shut down** (not by holding the power button or pulling the plug)
+- [ ] After changing settings: one full shutdown → power-on cycle before testing
+
+## 3. Network adapter (Device Manager → adapter → Properties)
+
+**Power Management tab**
+- [ ] *Allow this device to wake the computer* ✔
+- [ ] *Only allow a magic packet to wake the computer* ✔
+
+**Advanced tab** (names vary by vendor)
+- [ ] *Wake on Magic Packet* → `Enabled`
+- [ ] *Shutdown Wake-On-LAN* / *Wake from power off state* → `Enabled` (Realtek / Intel)
+- [ ] *Wake on Pattern Match* → `Disabled` (prevents random wake-ups; not needed for magic packets)
+- [ ] *Energy-Efficient Ethernet* / *Green Ethernet* / *EEE* → `Disabled`
+- [ ] *Reduce speed during standby* / *Wake on Link Settings*: note the value, because WoL often links at **10/100 Mbit** when off (see §7)
+- [ ] Latest NIC driver from the **chipset vendor** (Intel / Realtek), not only the Windows Update one
+
+## 4. Physical check while the PC is off
+
+- [ ] Shut down and wait **at least 1–2 hours**
+- [ ] NIC link LED on the PC **still lit** (often amber / slow)
+- [ ] Switch port LED still lit (ask the admin to confirm the port is *up* and at what speed)
+
+> LED dark → the NIC has no power or no link → back to §1. Nothing on the network side can fix that.
+
+## 5. Isolation test: Raspberry Pi with a direct cable
+
+This removes the corporate network from the picture. No switch is needed; the Pi 4 auto-crosses a normal Ethernet cable.
+
+```bash
+sudo apt install etherwake wakeonlan
+```
+
+- [ ] Pi on **Wi-Fi** (for SSH), Pi `eth0` cabled **directly** to the PC
+- [ ] PC shut down for **1–2 hours**, LED still lit
+- [ ] Send both packet types:
+  ```bash
+  sudo etherwake -i eth0 AA:BB:CC:DD:EE:FF   # raw Ethernet (EtherType 0x0842)
+  sudo etherwake -b -i eth0 AA:BB:CC:DD:EE:FF # same, to broadcast address
+  wakeonlan AA:BB:CC:DD:EE:FF                 # UDP broadcast, port 9
+  ```
+
+| Result | Conclusion |
+|---|---|
+| ❌ Doesn't wake | **PC configuration** is still wrong → §1–§4 |
+| ✅ Wakes | PC is fine → the problem is the **network** → §6 |
+
+## 6. Same-VLAN test on the real network
+
+- [ ] Pi plugged into the **same VLAN** as the PC (ideally the same access switch)
+- [ ] Sniffer running to prove the packet arrives:
+  ```bash
+  sudo tcpdump -i eth0 -e -n 'ether proto 0x0842 or udp port 9 or udp port 7'
+  ```
+- [ ] Find the **failure threshold**: send `etherwake` after the PC has been off for 2, 5, 10, 30 min, 1 h, 4 h
+
+| Starts failing after | Likely cause |
+|---|---|
+| ~5 min, unicast only | Switch MAC address-table aging (default 300 s). Broadcast should still work |
+| Minutes, **broadcast fails too** | **802.1X / NAC**: unauthorized port drops all egress traffic |
+| Any time, broadcast fails | Port speed forced to 1G, EEE, storm control, port-security |
+| ~4 h, only from another subnet | Router ARP timeout (Cisco default 4 h) |
+
+## 7. Switch port (for the network admin)
+
+- [ ] Port status while PC is off: **up/down**, negotiated **speed**
+- [ ] Speed/duplex on **auto** (not forced 1000), so the 10/100 WoL link can come up
+- [ ] **802.1X / MAB**: unidirectional control enabled
+  (Cisco: `authentication control-direction in`; older IOS: `dot1x control-direction in`)
+- [ ] EEE (`no power efficient-ethernet auto`) off on the port if the link drops
+- [ ] Storm control isn't dropping broadcasts on that VLAN
+- [ ] Port-security / sticky MAC not shutting the port when the MAC disappears
+- [ ] Dynamic VLAN assignment: PC lands in the **same VLAN** when unauthenticated
+
+## 8. Permanent fix for waking across subnets
+
+A powered-off PC doesn't answer ARP, so a routed unicast magic packet is **dropped by design** once the ARP entry expires. Choose one:
+
+- [ ] **WoL relay on the same VLAN**: the Raspberry Pi stays on the PC's VLAN; SSH in (VPN / Tailscale) and run `etherwake`
+- [ ] **Static ARP entry** on the router for the PC's (DHCP-reserved) IP → MAC
+- [ ] **Subnet-directed broadcast** allowed on the VLAN interface, restricted by ACL to UDP/9 from the trusted source
+  (Cisco: `ip directed-broadcast <acl>` on the SVI)
+
+---
+
+### What to bring to the admin
+
+1. Result of §5 (direct cable: wakes / doesn't wake)
+2. The failure threshold from §6
+3. The tcpdump output showing the packet reaches the VLAN
+4. The specific request from §7 / §8
