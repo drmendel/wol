@@ -1,25 +1,29 @@
 #!/bin/bash
 # Raspberry Pi setup for the WoL isolation test (CHECKLIST.md section 5).
 #
-#   sudo ./setup.sh <PC_MAC> [PC_IP[/prefix]] [UDP_PORT]
+#   sudo ./setup.sh <PC_MAC|auto> [PC_IP[/prefix]] [UDP_PORT]
 #
-#   PC_MAC   MAC address of the PC to wake (required)
-#   PC_IP    optional: pin the PC to this IP via DHCP reservation; the Pi's eth0
-#            address is derived from it (first free host of the same subnet).
+#   PC_MAC   MAC address of the PC to wake, or "auto": learned from the DHCP lease
+#            the first time the PC is awake on the cable
+#   PC_IP    optional: give the PC exactly this IP (e.g. the one it has on the company
+#            network). The DHCP pool is shrunk to this single address and the Pi's eth0
+#            address is derived from it (first free host of the same subnet, default /24).
 #            Omit it and the PC gets an automatic address; wol-test reads it from the lease.
 #   UDP_PORT optional: magic-packet port, default 9 (UpSnap default)
 #
 # Re-run any time to change the values. Wi-Fi (for SSH) is not touched.
 set -euo pipefail
 [ "$(id -u)" -eq 0 ] || exec sudo "$0" "$@"
-MAC=${1:?usage: setup.sh <PC_MAC> [PC_IP[/prefix]] [UDP_PORT]}
+MAC=${1:?usage: setup.sh <PC_MAC|auto> [PC_IP[/prefix]] [UDP_PORT]}
 PCIP=${2:-}
 PORT=${3:-9}
 IFACE=eth0
 DIR=$(cd "$(dirname "$0")" && pwd)
 
-[[ $MAC =~ ^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$ ]] || { echo "invalid MAC: $MAC"; exit 1; }
-MAC=$(tr 'A-F-' 'a-f:' <<<"$MAC")
+if [ "$MAC" != auto ]; then
+  [[ $MAC =~ ^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$ ]] || { echo "invalid MAC: $MAC"; exit 1; }
+  MAC=$(tr 'A-F-' 'a-f:' <<<"$MAC")
+fi
 
 echo "==> Installing packages"
 apt-get update -qq
@@ -43,10 +47,13 @@ print(f"{pi}/{pc.network.prefixlen}")
 EOF
 )
   PCIP=${PCIP%/*}
-  ADDR=(ipv4.addresses "$PIADDR")
-  mkdir -p /etc/NetworkManager/dnsmasq-shared.d
-  echo "dhcp-host=$MAC,$PCIP,infinite" > /etc/NetworkManager/dnsmasq-shared.d/wol-test.conf
-  echo "    Pi eth0 = $PIADDR, PC reserved = $PCIP"
+  # single-address pool: whatever PC is on the direct cable gets exactly $PCIP
+  ADDR=(ipv4.addresses "$PIADDR" ipv4.shared-dhcp-range "$PCIP,$PCIP" ipv4.shared-dhcp-lease-time 300)
+  if [ "$MAC" != auto ]; then
+    mkdir -p /etc/NetworkManager/dnsmasq-shared.d
+    echo "dhcp-host=$MAC,$PCIP" > /etc/NetworkManager/dnsmasq-shared.d/wol-test.conf
+  fi
+  echo "    Pi eth0 = $PIADDR, PC gets $PCIP (MAC: $MAC)"
 else
   echo "    automatic subnet; the PC's IP is read from the DHCP lease"
 fi

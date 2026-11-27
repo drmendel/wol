@@ -3,8 +3,7 @@
 # Install with pi/setup.sh. Docs: CHECKLIST.md section 5.
 set -u
 [ -r /etc/wol-test.conf ] && . /etc/wol-test.conf
-MAC=${MAC:?set MAC in /etc/wol-test.conf (run pi/setup.sh)}
-MAC=$(tr 'A-F' 'a-f' <<<"$MAC")
+CONF_MAC=$(tr 'A-F' 'a-f' <<<"${MAC:-auto}")   # "auto": learn the PC's MAC from the DHCP lease
 IP=${IP:-}                   # optional: if empty, the PC's IP is taken from the DHCP lease
 PORT=${PORT:-9}              # UDP port of the magic packet (UpSnap default: 9)
 IFACE=${IFACE:-eth0}
@@ -19,19 +18,29 @@ mkdir -p "$STATE" "$PCAP"
 log() { echo "$(date '+%F %T') $*" | tee -a "$LOG"; }
 dur() { local s=$1; printf '%dh%02dm%02ds' $((s/3600)) $((s%3600/60)) $((s%60)); }
 
-# PC IP: configured > current DHCP lease for the MAC > last IP the monitor saw
+LEASES=/var/lib/NetworkManager/dnsmasq-$IFACE.leases   # "<expiry> <mac> <ip> <host> <id>"
+
+# PC MAC: configured > newest DHCP lease (only the PC is on the direct cable) > last MAC seen
+pc_mac() {
+  [ "$CONF_MAC" != auto ] && { echo "$CONF_MAC"; return; }
+  local m; m=$(sort -n "$LEASES" 2>/dev/null | tail -1 | awk '{print tolower($2)}')
+  [ -n "$m" ] && { echo "$m" > "$STATE/pc_mac"; echo "$m"; return; }
+  cat "$STATE/pc_mac" 2>/dev/null
+}
+# PC IP: configured > current DHCP lease for the MAC > last IP seen
 pc_ip() {
   [ -n "$IP" ] && { echo "$IP"; return; }
-  local l; l=$(awk -v m="$MAC" 'tolower($2)==m {print $3}' /var/lib/NetworkManager/dnsmasq-"$IFACE".leases 2>/dev/null | tail -1)
+  local l; l=$(awk -v m="$(pc_mac)" 'tolower($2)==m {print $3}' "$LEASES" 2>/dev/null | tail -1)
   [ -n "$l" ] && { echo "$l" > "$STATE/pc_ip"; echo "$l"; return; }
   cat "$STATE/pc_ip" 2>/dev/null
 }
 need_ip() {
-  TARGET=$(pc_ip)
-  [ -n "$TARGET" ] && return
-  log "!! PC IP unknown: wake the PC once with the cable plugged in so it gets a DHCP lease (or set IP in /etc/wol-test.conf)."
+  MAC=$(pc_mac); TARGET=$(pc_ip)
+  [ -n "$MAC" ] && [ -n "$TARGET" ] && return
+  log "!! PC MAC/IP unknown: plug the cable in and wake the PC once so it gets a DHCP lease (or set MAC/IP in /etc/wol-test.conf)."
   exit 3
 }
+MAC=$(pc_mac)
 alive() { local t; t=$(pc_ip); [ -n "$t" ] && ping -c1 -W1 -I "$IFACE" "$t" >/dev/null 2>&1; }
 
 asleep_for() {
@@ -94,7 +103,7 @@ check_link() {
 case "${1:-help}" in
   status)
     t=$(pc_ip)
-    echo "PC        : $MAC  ${t:-IP unknown} (UDP port $PORT)"
+    echo "PC        : ${MAC:-MAC unknown}$( [ "$CONF_MAC" = auto ] && echo " (auto)")  ${t:-IP unknown} (UDP port $PORT)"
     echo "$IFACE link : $( [ "$(cat /sys/class/net/"$IFACE"/carrier 2>/dev/null)" = 1 ] && echo "UP $(cat /sys/class/net/"$IFACE"/speed)Mb/s" || echo DOWN)"
     echo "Pi $IFACE IP: $(ip -4 -br addr show "$IFACE" | awk '{print $3}')"
     [ -n "$t" ] && echo "ARP entry : $(ip neigh show "$t" dev "$IFACE" | head -1)"
@@ -114,12 +123,12 @@ case "${1:-help}" in
     prev=""
     while true; do
       if alive; then date +%s > "$STATE/last_online"; cur=AWAKE; else cur=ASLEEP; fi
-      [ "$cur" != "$prev" ] && log "[monitor] PC $(pc_ip) is now $cur"
+      [ "$cur" != "$prev" ] && log "[monitor] PC $(pc_mac) $(pc_ip) is now $cur"
       prev=$cur; sleep 15
     done ;;
   log) tail -n "${2:-40}" "$LOG" ;;
   *) cat <<EOF
-wol-test: Wake-on-LAN isolation test for $MAC on $IFACE (UDP port $PORT)
+wol-test: Wake-on-LAN isolation test for ${MAC:-<MAC not learned yet>} on $IFACE (UDP port $PORT)
   wol-test status    link state, PC IP, ARP entry, how long the PC has been asleep
   wol-test run       FULL TEST: unicast (UpSnap-style) -> static-ARP unicast -> raw etherwake
   wol-test unicast   only the UpSnap-style unicast UDP magic packet to the PC's IP

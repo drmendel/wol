@@ -67,8 +67,11 @@ This removes the corporate network from the picture. No switch is needed; the Pi
 ```bash
 git clone https://github.com/drmendel/wol && cd wol/pi
 sudo ./setup.sh AA:BB:CC:DD:EE:FF                # PC gets an automatic IP (read from the lease)
-sudo ./setup.sh AA:BB:CC:DD:EE:FF 192.168.50.4   # or: pin the PC's IP, Pi address is derived
+sudo ./setup.sh AA:BB:CC:DD:EE:FF 192.168.50.4   # or: give the PC the IP it has on its real network
+sudo ./setup.sh auto 192.168.50.4                # MAC unknown? learned from the lease once the PC is awake
 ```
+
+With an IP, the Pi serves exactly that one address on its subnet (Pi `eth0` = first free host of it), so the PC keeps the IP it has on the company network.
 
 **Find the Pi** from the laptop (on the same hotspot), whatever subnet the hotspot uses:
 
