@@ -3,7 +3,10 @@
 # Install with pi/setup.sh. Docs: CHECKLIST.md section 5.
 set -u
 export LC_ALL=C.UTF-8
-[ -r /etc/wol-test.conf ] && . /etc/wol-test.conf
+CONF=/etc/wol-test.conf           # active target (written by "wol-test use")
+PROFILES=/etc/wol-test/profiles   # "<name> <ip/prefix> <mac>" per line
+[ -r "$CONF" ] && . "$CONF"
+PROFILE=${PROFILE:-}
 CONF_MAC=$(tr 'A-F' 'a-f' <<<"${MAC:-auto}")   # "auto": learn the PC's MAC from the DHCP lease
 IP=${IP:-}                   # optional: if empty, the PC's IP is taken from the DHCP lease
 PORT=${PORT:-9}              # UDP port of the magic packet (UpSnap default: 9)
@@ -82,8 +85,9 @@ alive() {
   [ -n "$m" ] && timeout "$secs" tcpdump -i "$IFACE" -c1 -nn "ether src $m and ip" >/dev/null 2>&1
 }
 asleep_secs() {
-  [ -s "$STATE/last_online" ] || { echo -1; return; }
-  echo $(( $(date +%s) - $(cat "$STATE/last_online") ))
+  local f="$STATE/last_online.$(pc_mac)"
+  [ -s "$f" ] || { echo -1; return; }
+  echo $(( $(date +%s) - $(cat "$f") ))
 }
 link_up()    { [ "$(cat /sys/class/net/"$IFACE"/carrier 2>/dev/null)" = 1 ]; }
 link_speed() { cat /sys/class/net/"$IFACE"/speed 2>/dev/null; }
@@ -121,6 +125,69 @@ check_route() {
         "$IFACE has $(ip -4 -br addr show "$IFACE" | awk '{print $3}'): the wrong network profile is active." \
         "Fix: sudo nmcli con up wol-direct   (then wake the PC once)"
 }
+
+# ---------------------------------------------------------------- profiles / target switch
+norm_mac() {
+  local m; m=$(tr 'A-F-' 'a-f:' <<<"$1")
+  [[ $m == auto || $m =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] && echo "$m"
+}
+is_cidr() { [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]; }
+
+# resolve_target <profile> | <ip[/prefix]> <mac>   (either order)  -> T_NAME T_CIDR T_MAC
+resolve_target() {
+  if [ $# -eq 1 ]; then
+    read -r T_NAME T_CIDR T_MAC < <(awk -v n="$1" '$1==n {print $1, $2, $3}' "$PROFILES" 2>/dev/null)
+    [ -n "${T_NAME:-}" ] || die 5 "Unknown profile: $1" "Saved profiles: $(awk '!/^#/ && NF {printf "%s ", $1}' "$PROFILES" 2>/dev/null)" \
+      "Add one: wol-test profile add <name> <ip/prefix> <mac>"
+  elif [ $# -eq 2 ]; then
+    T_NAME=""
+    if is_cidr "$1"; then T_CIDR=$1; T_MAC=$2; else T_CIDR=$2; T_MAC=$1; fi
+  else
+    die 5 "Give a profile name, or <ip/prefix> <mac>" "e.g. wol-test run home   or   wol-test run 192.168.50.4/24 AA-BB-CC-DD-EE-FF"
+  fi
+  is_cidr "$T_CIDR" || die 5 "Not an IP or IP/prefix: $T_CIDR"
+  [[ $T_CIDR == */* ]] || T_CIDR="$T_CIDR/24"
+  T_MAC=$(norm_mac "$T_MAC") || die 5 "Not a MAC address: $T_MAC"
+  [ -n "$T_MAC" ] || die 5 "Not a MAC address"
+}
+
+# Point eth0 + DHCP at the target: Pi takes the first free host of the PC's subnet,
+# the DHCP pool is exactly the PC's IP (reserved for its MAC).
+apply_target() {
+  local ip=${T_CIDR%/*} pi
+  if [ "${IP:-}/${PREFIX:-}" = "$T_CIDR" ] && [ "$CONF_MAC" = "$T_MAC" ] \
+     && nmcli -g GENERAL.STATE con show wol-direct 2>/dev/null | grep -q activated; then
+    PROFILE=$T_NAME
+    printf '\n  %s Already on %s%s%s\n' "$OK" "$B" "${T_NAME:-$T_CIDR}" "$N"; return
+  fi
+  nmcli -g connection.id con show wol-direct >/dev/null 2>&1 || die 6 "Profile wol-direct missing" "Run: sudo ~/wol/pi/setup.sh"
+  pi=$(python3 -I -c 'import ipaddress,sys
+pc=ipaddress.ip_interface(sys.argv[1]); h=pc.network.hosts(); a=next(h)
+print(f"{a if a!=pc.ip else next(h)}/{pc.network.prefixlen}")' "$T_CIDR") || die 5 "Bad subnet: $T_CIDR"
+  nmcli con mod wol-direct ipv4.method shared ipv4.addresses "$pi" ipv4.shared-dhcp-range "$ip,$ip" \
+    ipv4.shared-dhcp-lease-time 300 ipv6.method disabled
+  mkdir -p /etc/NetworkManager/dnsmasq-shared.d
+  if [ "$T_MAC" = auto ]; then rm -f /etc/NetworkManager/dnsmasq-shared.d/wol-test.conf
+  else echo "dhcp-host=$T_MAC,$ip" > /etc/NetworkManager/dnsmasq-shared.d/wol-test.conf; fi
+  cat > "$CONF" <<EOF
+PROFILE=$T_NAME
+MAC=$T_MAC
+IP=$ip
+PREFIX=${T_CIDR#*/}
+PORT=$PORT
+IFACE=$IFACE
+WAIT=$WAIT
+EOF
+  rm -f "$STATE/last_online.$T_MAC" "$STATE/pc_mac" "$STATE/pc_ip"   # sleep timer starts fresh
+  link_up && nmcli --wait 15 con up wol-direct >/dev/null 2>&1
+  systemctl restart wol-monitor 2>/dev/null
+  PROFILE=$T_NAME CONF_MAC=$T_MAC IP=$ip PREFIX=${T_CIDR#*/}; MAC=$(pc_mac)
+  log "[use] ${T_NAME:-custom}: PC $T_MAC $ip/$PREFIX, Pi eth0 $pi"
+  printf '\n  %s Switched to %s%s%s  %s(Pi eth0 %s, PC gets %s)%s\n' "$OK" "$B" "${T_NAME:-$T_CIDR}" "$N" "$D" "$pi" "$ip" "$N"
+}
+# optional target arguments on run / status / single shots
+target_args() { [ $# -gt 0 ] && { resolve_target "$@"; apply_target; }; return 0; }
+prof_name() { awk -v m="$1" '$3==m {print $1; exit}' "$PROFILES" 2>/dev/null; }
 
 # ---------------------------------------------------------------- shots
 declare -A TITLE=([unicast]="Unicast" [static]="Unicast, ARP pinned" [raw]="Raw Ethernet")
@@ -209,10 +276,48 @@ cell() { # cell <result> <width>
 }
 
 # ---------------------------------------------------------------- commands
-case "${1:-help}" in
+cmd=${1:-help}; shift 2>/dev/null
+case "$cmd" in
+  use)          # switch target without running: wol-test use corp
+    [ $# -gt 0 ] || die 5 "Which target?" "wol-test use <profile>   or   wol-test use <ip/prefix> <mac>"
+    target_args "$@"; echo ;;
+
+  profiles)
+    banner "Wake-on-LAN test · profiles" "$(date '+%F %H:%M')"
+    if ! awk '!/^#/ && NF {f=1} END {exit !f}' "$PROFILES" 2>/dev/null; then
+      note "No profiles yet. Add one: wol-test profile add <name> <ip/prefix> <mac>"
+    else
+      while read -r n c m; do
+        [[ -z $n || $n == \#* ]] && continue
+        [ "$m" = "$CONF_MAC" ] && [ "${c%/*}" = "$IP" ] && a="${G}● active${N}" || a=""
+        printf '  %s%s%s %s %s %s\n' "$B" "$(pad "$n" 10)" "$N" "$(pad "$c" 20)" "$(pad "$m" 19)" "$a"
+      done < "$PROFILES"
+    fi
+    echo ;;
+
+  profile)      # profile add <name> <ip/prefix> <mac> | profile rm <name>
+    sub=${1:-}; name=${2:-}
+    case "$sub" in
+      add)
+        [ $# -eq 4 ] || die 5 "Usage: wol-test profile add <name> <ip/prefix> <mac>"
+        [[ $name =~ ^[A-Za-z0-9_-]+$ ]] || die 5 "Profile name: letters, digits, - and _ only"
+        resolve_target "$3" "$4"
+        mkdir -p "${PROFILES%/*}"; touch "$PROFILES"
+        sed -i "/^$name[[:space:]]/d" "$PROFILES"
+        printf '%s %s %s\n' "$name" "$T_CIDR" "$T_MAC" >> "$PROFILES"
+        printf '\n  %s Saved profile %s%s%s  %s%s  %s%s\n\n' "$OK" "$B" "$name" "$N" "$D" "$T_CIDR" "$T_MAC" "$N" ;;
+      rm)
+        [ -n "$name" ] && grep -q "^$name[[:space:]]" "$PROFILES" 2>/dev/null || die 5 "Unknown profile: $name"
+        sed -i "/^$name[[:space:]]/d" "$PROFILES"
+        printf '\n  %s Removed profile %s%s%s\n\n' "$OK" "$B" "$name" "$N" ;;
+      *) die 5 "Usage: wol-test profile add <name> <ip/prefix> <mac>  |  wol-test profile rm <name>" ;;
+    esac ;;
+
   status)
+    target_args "$@"
     t=$(pc_ip)
     banner "Wake-on-LAN test · status" "$(date '+%F %H:%M')"
+    kv "Profile"   "${B}${PROFILE:-${t:-none}}${N}"
     kv "PC"        "${B}${MAC:-MAC unknown}${N}  →  ${B}${t:-IP unknown}${N}  ${D}(UDP $PORT$( [ "$CONF_MAC" = auto ] && echo ", MAC auto"))${N}"
     kv "Cable"     "$(link_pretty)"
     kv "Pi eth0"   "$(ip -4 -br addr show "$IFACE" | awk '{print $3}')"
@@ -226,14 +331,15 @@ case "${1:-help}" in
     echo ;;
 
   run)          # the full experiment: UpSnap-style unicast first, then the controls
+    target_args "$@"
     check_link; need_target; check_route
-    banner "Wake-on-LAN test" "$(date '+%F %H:%M')"
+    banner "Wake-on-LAN test${PROFILE:+ · $PROFILE}" "$(date '+%F %H:%M')"
     if alive 15; then die 1 "The PC is awake" "Put it to sleep (or shut it down) first, then run the test after the wait."; fi
     s=$(asleep_secs); sp=$(link_speed)
     kv "PC"     "${B}$MAC${N}  →  ${B}$TARGET${N}  ${D}(UDP $PORT)${N}"
-    kv "Asleep" "$(hdur "$s")"
+    kv "Asleep" "$(hdur "$s")$([ "$s" -lt 0 ] && echo "  ${D}(switch with \"wol-test use\" before the PC sleeps to time it)${N}")"
     kv "Cable"  "$(link_pretty)"
-    log "===== WoL test run | PC $MAC @ $TARGET | asleep $(hdur "$s") | link ${sp}Mb/s ====="
+    log "===== WoL test run | ${PROFILE:-custom} | PC $MAC @ $TARGET | asleep $(hdur "$s") | link ${sp}Mb/s ====="
     if   try 1 unicast; then key=unicast
     elif try 2 static;  then key=static
     elif try 3 raw;     then key=raw
@@ -245,46 +351,51 @@ case "${1:-help}" in
     result_box "$key" ;;
 
   report)       # every run in one table: the page to show
-    W=93
+    W=96
     banner "Wake-on-LAN test results" "$(date '+%F %H:%M')"
-    if ! [ -s "$RUNS" ] || [ "$(wc -l < "$RUNS")" -le 1 ]; then note "No runs yet. Start one with: wol-test run"; echo; exit 0; fi
-    printf '  %s%s %s %s %s %s %s%s\n' "$B" "$(pad Date 16)" "$(pad Asleep 13)" "$(pad "1 UpSnap" 16)" \
-      "$(pad "2 ARP pinned" 16)" "$(pad "3 Raw" 16)" "Verdict" "$N"
+    if ! [ -s "$RUNS" ] || [ "$(wc -l < "$RUNS")" -le 1 ]; then note "No runs yet. Start one with: wol-test run <profile>"; echo; exit 0; fi
+    printf '  %s%s %s %s %s %s %s %s%s\n' "$B" "$(pad Date 16)" "$(pad PC 8)" "$(pad Asleep 12)" "$(pad "1 UpSnap" 15)" \
+      "$(pad "2 ARP pinned" 15)" "$(pad "3 Raw" 15)" "Verdict" "$N"
     rule
     while IFS=$'\t' read -r d s sp mac ip u st rw v; do
-      printf '  %s %s %s %s %s %s%s%s\n' "$(pad "$d" 16)" "$(pad "$(hdur "$s")" 13)" "$(cell "$u" 16)" \
-        "$(cell "$st" 16)" "$(cell "$rw" 16)" "$B" "${SHORT[$v]:-$v}" "$N"
+      pn=$(prof_name "$mac"); pn=${pn:-$ip}
+      printf '  %s %s %s %s %s %s %s%s%s\n' "$(pad "$d" 16)" "$(pad "$pn" 8)" "$(pad "$(hdur "$s")" 12)" "$(cell "$u" 15)" \
+        "$(cell "$st" 15)" "$(cell "$rw" 15)" "$B" "${SHORT[$v]:-$v}" "$N"
     done < <(tail -n +2 "$RUNS")
     rule
-    IFS=$'\t' read -r _ _ _ mac ip _ _ _ v < <(tail -1 "$RUNS")
-    printf '  %sPC%s      %s → %s  ·  direct cable to the Pi, no switch or router\n' "$D" "$N" "$mac" "$ip"
+    IFS=$'\t' read -r _ _ _ _ _ _ _ _ v < <(tail -1 "$RUNS")
+    printf '  %sSetup%s   PC cabled directly to the Pi, no switch or router in between\n' "$D" "$N"
     printf '  %sLatest%s  %s%s%s\n\n' "$D" "$N" "$B" "${VERDICT[$v]%%|*}" "$N" ;;
 
   unicast|static|raw)
+    target_args "$@"
     check_link; need_target; check_route
     banner "Wake-on-LAN test · single shot" "$(date '+%F %H:%M')"
-    try "·" "$1"; echo ;;
+    try "·" "$cmd"; echo ;;
 
   monitor)      # systemd service: track when the PC goes to sleep / wakes up
     prev=""
     while true; do
-      if alive 10; then date +%s > "$STATE/last_online"; cur=AWAKE; else cur=ASLEEP; fi
+      if alive 10; then date +%s > "$STATE/last_online.$(pc_mac)"; cur=AWAKE; else cur=ASLEEP; fi
       [ "$cur" != "$prev" ] && log "[monitor] PC $(pc_mac) $(pc_ip) is now $cur"
       prev=$cur; sleep 5
     done ;;
 
-  log) tail -n "${2:-40}" "$LOG" ;;
+  log) tail -n "${1:-40}" "$LOG" ;;
 
   *)
     banner "wol-test" "Wake-on-LAN isolation test"
-    kv "PC" "${MAC:-MAC not learned yet}  ·  $IFACE  ·  UDP $PORT"
+    kv "Active" "${B}${PROFILE:-custom}${N}  ·  ${MAC:-MAC not learned yet}  →  ${IP:-IP from lease}"
     echo
-    kv "status"  "cable, ARP entry, how long the PC has been asleep"
-    kv "run"     "${B}full test${N}: 1 unicast (UpSnap) → 2 ARP pinned → 3 raw"
-    kv "report"  "${B}all runs in one table${N} (the page to show)"
-    kv "unicast" "only shot 1   ·   static: only shot 2   ·   raw: only shot 3"
-    kv "log [n]" "detailed log with timestamps"
+    kv "run"      "${B}full test${N}: 1 unicast (UpSnap) → 2 ARP pinned → 3 raw"
+    kv "report"   "${B}all runs in one table${N} (the page to show)"
+    kv "status"   "cable, ARP entry, how long the PC has been asleep"
+    kv "use"      "switch target only, do this before the PC goes to sleep"
+    kv "profiles" "list saved targets  ·  profile add <name> <ip/prefix> <mac>  ·  profile rm <name>"
+    kv "unicast"  "only shot 1   ·   static: only shot 2   ·   raw: only shot 3"
+    kv "log [n]"  "detailed log with timestamps"
     echo
-    kv "Files" "${D}/etc/wol-test.conf  ·  $LOG  ·  $PCAP/${N}"
+    kv "Target"   "run / status / use / single shots take ${B}<profile>${N} or ${B}<ip/prefix> <mac>${N}"
+    kv "Examples" "wol-test run home   ·   wol-test run 172.26.10.240/24 A0-AD-9F-B4-97-7B"
     echo ;;
 esac

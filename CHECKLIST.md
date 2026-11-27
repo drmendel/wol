@@ -65,13 +65,11 @@ This removes the corporate network from the picture. No switch is needed; the Pi
 **Setup (once)**: the Pi joins your phone hotspot / Wi-Fi for SSH; `eth0` gets a DHCP server for the PC.
 
 ```bash
-git clone https://github.com/drmendel/wol && cd wol/pi
-sudo ./setup.sh AA:BB:CC:DD:EE:FF                # PC gets an automatic IP (read from the lease)
-sudo ./setup.sh AA:BB:CC:DD:EE:FF 192.168.50.4   # or: give the PC the IP it has on its real network
-sudo ./setup.sh auto 192.168.50.4                # MAC unknown? learned from the lease once the PC is awake
+git clone https://github.com/drmendel/wol && sudo wol/pi/setup.sh
+wol-test profile add home 192.168.50.4/24 AA-BB-CC-DD-EE-FF   # save each PC: name, ip/prefix, MAC
 ```
 
-With an IP, the Pi serves exactly that one address on its subnet (Pi `eth0` = first free host of it), so the PC keeps the IP it has on the company network.
+`wol-test use <profile>` points the Pi at a PC: Pi `eth0` takes the first free host of the PC's subnet and the DHCP server hands out exactly the PC's IP, so the PC keeps the address it has on its real network. `run`, `status` and the single shots also take `<profile>` or `<ip/prefix> <mac>` directly, e.g. `wol-test run 192.168.50.4/24 AA-BB-CC-DD-EE-FF`.
 
 **Find the Pi** from the laptop (on the same hotspot), whatever subnet the hotspot uses:
 
@@ -82,9 +80,9 @@ ssh <user>@<pi-ip>
 
 **Run**
 
-- [ ] Pi `eth0` cabled **directly** to the PC; wake the PC once so it gets its DHCP lease
+- [ ] `wol-test use <profile>`, Pi `eth0` cabled **directly** to the PC; wake the PC once so it gets its DHCP lease
 - [ ] Put the PC to sleep / shut it down for **1–2 hours** (`wol-test status` shows how long), LED still lit
-- [ ] `wol-test run` sends, in order, and stops at the first one that wakes the PC:
+- [ ] `wol-test run <profile>` sends, in order, and stops at the first one that wakes the PC:
 
 | Shot | What is sent | Woke the PC → conclusion |
 |---|---|---|
@@ -93,7 +91,7 @@ ssh <user>@<pi-ip>
 | `raw` | `etherwake`, raw Ethernet (EtherType 0x0842) | PC fine, problem is on the UDP/ARP path → §6–§8 |
 | none, link up | | **PC configuration** is still wrong → §1–§4 |
 
-> **Why three shots?** A sleeping PC doesn't answer ARP. Once the sender's ARP entry expires, a *unicast* magic packet never leaves the sender; the kernel drops it after the unanswered `who-has`. That happens on the Pi too, so a failed plain unicast alone doesn't prove the PC is at fault. Each shot logs the neighbour entry and a pcap of what actually went on the wire (`wol-test log`, `/var/log/wol-test/*.pcap`): bring that to the admin.
+> **Why three shots?** A sleeping PC doesn't answer ARP. Once the sender's ARP entry expires, a *unicast* magic packet never leaves the sender; the kernel drops it after the unanswered `who-has`. That happens on the Pi too, so a failed plain unicast alone doesn't prove the PC is at fault. Each shot logs the neighbour entry and a pcap of what actually went on the wire (`wol-test report` for the summary table, `wol-test log`, `/var/log/wol-test/*.pcap`): bring that to the admin.
 
 If `eth0` has no link while the PC is off, `wol-test` stops: the NIC is unpowered (§1, §4) and no packet can help.
 

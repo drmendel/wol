@@ -1,78 +1,42 @@
 #!/bin/bash
 # Raspberry Pi setup for the WoL isolation test (CHECKLIST.md section 5).
 #
-#   sudo ./setup.sh <PC_MAC|auto> [PC_IP[/prefix]] [UDP_PORT]
+#   sudo ./setup.sh [<profile> | <ip/prefix> <mac>]
 #
-#   PC_MAC   MAC address of the PC to wake, or "auto": learned from the DHCP lease
-#            the first time the PC is awake on the cable
-#   PC_IP    optional: give the PC exactly this IP (e.g. the one it has on the company
-#            network). The DHCP pool is shrunk to this single address and the Pi's eth0
-#            address is derived from it (first free host of the same subnet, default /24).
-#            Omit it and the PC gets an automatic address; wol-test reads it from the lease.
-#   UDP_PORT optional: magic-packet port, default 9 (UpSnap default)
+# Installs the tools, the eth0 profile "wol-direct" (DHCP server for the directly
+# cabled PC) and the sleep/wake monitor. Safe to re-run: existing config is kept.
+# Targets are managed afterwards with wol-test:
 #
-# Re-run any time to change the values. Wi-Fi (for SSH) is not touched.
+#   wol-test profile add home 192.168.50.4/24 AA-BB-CC-DD-EE-FF
+#   wol-test use home          # point eth0 + DHCP at that PC
+#   wol-test run home          # or switch and test in one go
+#
+# Optional arguments are passed to "wol-test use". Wi-Fi (for SSH) is not touched.
 set -euo pipefail
 [ "$(id -u)" -eq 0 ] || exec sudo "$0" "$@"
-MAC=${1:?usage: setup.sh <PC_MAC|auto> [PC_IP[/prefix]] [UDP_PORT]}
-PCIP=${2:-}
-PORT=${3:-9}
 IFACE=eth0
 DIR=$(cd "$(dirname "$0")" && pwd)
 
-if [ "$MAC" != auto ]; then
-  [[ $MAC =~ ^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$ ]] || { echo "invalid MAC: $MAC"; exit 1; }
-  MAC=$(tr 'A-F-' 'a-f:' <<<"$MAC")
-fi
-
 echo "==> Installing packages"
 apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wakeonlan etherwake tcpdump nmap dnsmasq-base >/dev/null
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wakeonlan etherwake tcpdump nmap dnsmasq-base python3 >/dev/null
 
 echo "==> Installing wol-test"
 if [ -f "$DIR/wol-test" ]; then install -m755 "$DIR/wol-test" /usr/local/bin/wol-test
 else curl -fsSL https://raw.githubusercontent.com/drmendel/wol/main/pi/wol-test -o /usr/local/bin/wol-test && chmod 755 /usr/local/bin/wol-test; fi
 
-echo "==> eth0: NetworkManager 'shared' profile (DHCP server for the directly cabled PC)"
-nmcli con delete wol-direct >/dev/null 2>&1 || true
-ADDR=()
-rm -f /etc/NetworkManager/dnsmasq-shared.d/wol-test.conf
-if [ -n "$PCIP" ]; then
-  PIADDR=$(python3 - "$PCIP" <<'EOF'
-import ipaddress, sys
-pc = ipaddress.ip_interface(sys.argv[1] if "/" in sys.argv[1] else sys.argv[1] + "/24")
-hosts = list(pc.network.hosts())
-pi = hosts[0] if hosts[0] != pc.ip else hosts[-1]
-print(f"{pi}/{pc.network.prefixlen}")
-EOF
-)
-  PCIP=${PCIP%/*}
-  # single-address pool: whatever PC is on the direct cable gets exactly $PCIP
-  ADDR=(ipv4.addresses "$PIADDR" ipv4.shared-dhcp-range "$PCIP,$PCIP" ipv4.shared-dhcp-lease-time 300)
-  if [ "$MAC" != auto ]; then
-    mkdir -p /etc/NetworkManager/dnsmasq-shared.d
-    echo "dhcp-host=$MAC,$PCIP" > /etc/NetworkManager/dnsmasq-shared.d/wol-test.conf
-  fi
-  echo "    Pi eth0 = $PIADDR, PC gets $PCIP (MAC: $MAC)"
-else
-  echo "    automatic subnet; the PC's IP is read from the DHCP lease"
-fi
-nmcli con add type ethernet ifname "$IFACE" con-name wol-direct autoconnect yes \
-  connection.autoconnect-priority 100 ipv4.method shared "${ADDR[@]}" ipv6.method disabled >/dev/null
-# activate now: otherwise another eth0 profile that grabbed the link meanwhile stays active
-if [ "$(cat /sys/class/net/$IFACE/carrier 2>/dev/null)" = 1 ]; then
-  nmcli --wait 15 con up wol-direct >/dev/null && echo "    wol-direct active on $IFACE"
-else
-  echo "    wol-direct activates when the cable is plugged in"
-fi
+echo "==> Profiles: /etc/wol-test/profiles"
+mkdir -p /etc/wol-test
+[ -f /etc/wol-test/profiles ] || echo "# <name> <ip/prefix> <mac>   (add with: wol-test profile add ...)" > /etc/wol-test/profiles
 
-cat > /etc/wol-test.conf <<EOF
-MAC=$MAC
-IP=$PCIP
-PORT=$PORT
-IFACE=$IFACE
-WAIT=120
-EOF
+echo "==> eth0: NetworkManager 'shared' profile wol-direct (DHCP for the directly cabled PC)"
+if nmcli -g connection.id con show wol-direct >/dev/null 2>&1; then
+  echo "    exists, kept"
+else
+  nmcli con add type ethernet ifname "$IFACE" con-name wol-direct autoconnect yes \
+    connection.autoconnect-priority 100 ipv4.method shared ipv6.method disabled >/dev/null
+  echo "    created (target set with: wol-test use ...)"
+fi
 
 echo "==> Monitor service (logs when the PC sleeps / wakes)"
 cat > /etc/systemd/system/wol-monitor.service <<'EOF'
@@ -89,6 +53,11 @@ systemctl daemon-reload
 systemctl enable wol-monitor >/dev/null 2>&1
 systemctl restart wol-monitor
 
+[ $# -gt 0 ] && /usr/local/bin/wol-test use "$@"
+
 echo
-echo "Done. Plug the cable into the PC, wake it once, put it to sleep, then later run: wol-test run"
+echo "Done. Next:"
+echo "  wol-test profile add <name> <ip/prefix> <mac>    save a PC"
+echo "  wol-test use <name>                              before the PC goes to sleep"
+echo "  wol-test run <name>                              after the wait"
 echo "Before plugging this Pi into a real network: sudo nmcli con down wol-direct  (it serves DHCP on eth0)"
