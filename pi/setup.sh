@@ -59,6 +59,12 @@ else
 fi
 nmcli con add type ethernet ifname "$IFACE" con-name wol-direct autoconnect yes \
   connection.autoconnect-priority 100 ipv4.method shared "${ADDR[@]}" ipv6.method disabled >/dev/null
+# activate now: otherwise another eth0 profile that grabbed the link meanwhile stays active
+if [ "$(cat /sys/class/net/$IFACE/carrier 2>/dev/null)" = 1 ]; then
+  nmcli --wait 15 con up wol-direct >/dev/null && echo "    wol-direct active on $IFACE"
+else
+  echo "    wol-direct activates when the cable is plugged in"
+fi
 
 cat > /etc/wol-test.conf <<EOF
 MAC=$MAC

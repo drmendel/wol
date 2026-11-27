@@ -41,21 +41,23 @@ need_ip() {
   exit 3
 }
 MAC=$(pc_mac)
-alive() { local t; t=$(pc_ip); [ -n "$t" ] && ping -c1 -W1 -I "$IFACE" "$t" >/dev/null 2>&1; }
+# Awake = answers ping, or sends IPv4 traffic within <secs> (Windows often blocks ping).
+# ARP and IPv6 are ignored on purpose: NIC ARP / NS offload answers them while asleep.
+alive() {
+  local secs=${1:-3} t m; t=$(pc_ip); m=$(pc_mac)
+  [ -n "$t" ] && ping -c1 -W1 -I "$IFACE" "$t" >/dev/null 2>&1 && return 0
+  [ -n "$m" ] && timeout "$secs" tcpdump -i "$IFACE" -c1 -nn "ether src $m and ip" >/dev/null 2>&1
+}
 
 asleep_for() {
   [ -s "$STATE/last_online" ] || { echo "unknown (not seen online since monitor start)"; return; }
   echo "$(dur $(( $(date +%s) - $(cat "$STATE/last_online") )))"
 }
 
-# Wait until the PC shows signs of life: ping reply, or it sends DHCP/IP traffic.
-# ARP replies are ignored on purpose: NIC "ARP offload" can answer ARP while asleep.
+# Wait until the PC shows signs of life (see alive).
 wait_wake() {
   local end=$((SECONDS + WAIT))
-  while [ $SECONDS -lt $end ]; do
-    alive && return 0
-    timeout 3 tcpdump -i "$IFACE" -c1 -nn "ether src $MAC and (udp port 67 or icmp or tcp or ip6)" >/dev/null 2>&1 && return 0
-  done
+  while [ $SECONDS -lt $end ]; do alive && return 0; done
   return 1
 }
 
@@ -100,6 +102,16 @@ check_link() {
   fi
 }
 
+# The packet must leave through eth0. If another profile owns eth0 (wrong subnet),
+# the kernel routes it out of Wi-Fi instead and the result would be meaningless.
+check_route() {
+  if ! ip route get "$TARGET" 2>/dev/null | grep -q " dev $IFACE "; then
+    log "!! $TARGET is not routed via $IFACE ($(ip -4 -br addr show "$IFACE" | awk '{print $3}')): wrong profile active on $IFACE."
+    log "!! Fix: sudo nmcli con up wol-direct   (then wake the PC once so it gets its lease)"
+    exit 4
+  fi
+}
+
 case "${1:-help}" in
   status)
     t=$(pc_ip)
@@ -107,24 +119,24 @@ case "${1:-help}" in
     echo "$IFACE link : $( [ "$(cat /sys/class/net/"$IFACE"/carrier 2>/dev/null)" = 1 ] && echo "UP $(cat /sys/class/net/"$IFACE"/speed)Mb/s" || echo DOWN)"
     echo "Pi $IFACE IP: $(ip -4 -br addr show "$IFACE" | awk '{print $3}')"
     [ -n "$t" ] && echo "ARP entry : $(ip neigh show "$t" dev "$IFACE" | head -1)"
-    echo "PC state  : $(alive && echo AWAKE || echo "not responding, asleep for $(asleep_for)")"
+    echo "PC state  : $(alive 8 && echo AWAKE || echo "not responding, asleep for $(asleep_for)")"
     echo "--- last log lines"; tail -n 8 "$LOG" 2>/dev/null ;;
   run)          # the full experiment: UpSnap-style unicast first, then the controls
-    check_link; need_ip
+    check_link; need_ip; check_route
     log "===== WoL test run | PC $MAC @ $TARGET | asleep for: $(asleep_for) | link $(cat /sys/class/net/"$IFACE"/speed)Mb/s ====="
-    if alive; then log "PC is awake, put it to sleep / shut it down first."; exit 1; fi
+    if alive 15; then log "PC is awake (checked 15 s), put it to sleep / shut it down first."; exit 1; fi
     if   try unicast; then log "RESULT: plain unicast (UpSnap-style) woke it after the sleep. PC is fine; no ARP problem on this path."
     elif try static;  then log "RESULT: unicast FAILED, the same packet WOKE the PC once ARP was pinned. PC is fine; the expired ARP entry is the problem."
     elif try raw;     then log "RESULT: only raw L2 etherwake woke it. PC is fine; the problem is on the UDP/ARP path."
     else                   log "RESULT: nothing woke it over a direct cable with link up. The PC / BIOS / NIC config is the problem (CHECKLIST §1-§3)."
     fi ;;
-  unicast|static|raw) check_link; need_ip; try "$1" ;;
+  unicast|static|raw) check_link; need_ip; check_route; try "$1" ;;
   monitor)      # systemd service: track when the PC goes to sleep / wakes up
     prev=""
     while true; do
-      if alive; then date +%s > "$STATE/last_online"; cur=AWAKE; else cur=ASLEEP; fi
+      if alive 10; then date +%s > "$STATE/last_online"; cur=AWAKE; else cur=ASLEEP; fi
       [ "$cur" != "$prev" ] && log "[monitor] PC $(pc_mac) $(pc_ip) is now $cur"
-      prev=$cur; sleep 15
+      prev=$cur; sleep 5
     done ;;
   log) tail -n "${2:-40}" "$LOG" ;;
   *) cat <<EOF
