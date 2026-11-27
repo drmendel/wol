@@ -52,7 +52,7 @@ die()    { # die <exit code> <headline> [detail lines...]
 }
 hdur() {
   local s=$1
-  if   [ "$s" -lt 0 ];     then echo "unknown"
+  if   [ "$s" -lt 0 ];     then echo "not tracked"
   elif [ "$s" -ge 3600 ];  then printf '%d h %02d min' $((s / 3600)) $((s % 3600 / 60))
   elif [ "$s" -ge 60 ];    then printf '%d min %02d s' $((s / 60)) $((s % 60))
   else printf '%d s' "$s"; fi
@@ -111,6 +111,20 @@ need_target() {
   [ -n "$MAC" ] && [ -n "$TARGET" ] && return
   die 3 "PC MAC / IP unknown" "Plug the cable in and wake the PC once so it gets a DHCP lease," \
         "or set MAC / IP in /etc/wol-test.conf."
+}
+# Cable just plugged in? Give the link and wol-direct up to 30 s to come up.
+wait_ready() {
+  local t=$SECONDS
+  while [ $((SECONDS - t)) -lt 30 ]; do
+    if link_up; then
+      nmcli -g GENERAL.STATE con show wol-direct 2>/dev/null | grep -q activated \
+        || nmcli --wait 10 con up wol-direct >/dev/null 2>&1
+      ip route get "$TARGET" 2>/dev/null | grep -q " dev $IFACE " && { clr; return 0; }
+    fi
+    [ -n "$TTY" ] && printf '\r  %s%s%s %ss ' "$D" "$(pad "Waiting for the cable link" 28)" "$N" $((SECONDS - t))
+    sleep 1
+  done
+  clr; return 0   # check_link / check_route report what is missing
 }
 check_link() {
   link_up && return
@@ -332,12 +346,12 @@ case "$cmd" in
 
   run)          # the full experiment: UpSnap-style unicast first, then the controls
     target_args "$@"
-    check_link; need_target; check_route
+    need_target; wait_ready; check_link; check_route
     banner "Wake-on-LAN test${PROFILE:+ · $PROFILE}" "$(date '+%F %H:%M')"
     if alive 15; then die 1 "The PC is awake" "Put it to sleep (or shut it down) first, then run the test after the wait."; fi
     s=$(asleep_secs); sp=$(link_speed)
     kv "PC"     "${B}$MAC${N}  →  ${B}$TARGET${N}  ${D}(UDP $PORT)${N}"
-    kv "Asleep" "$(hdur "$s")$([ "$s" -lt 0 ] && echo "  ${D}(switch with \"wol-test use\" before the PC sleeps to time it)${N}")"
+    kv "Asleep" "$(hdur "$s")$([ "$s" -lt 0 ] && echo "  ${D}(PC was off / asleep before the cable went in)${N}")"
     kv "Cable"  "$(link_pretty)"
     log "===== WoL test run | ${PROFILE:-custom} | PC $MAC @ $TARGET | asleep $(hdur "$s") | link ${sp}Mb/s ====="
     if   try 1 unicast; then key=unicast
@@ -369,7 +383,7 @@ case "$cmd" in
 
   unicast|static|raw)
     target_args "$@"
-    check_link; need_target; check_route
+    need_target; wait_ready; check_link; check_route
     banner "Wake-on-LAN test · single shot" "$(date '+%F %H:%M')"
     try "·" "$cmd"; echo ;;
 
@@ -390,7 +404,7 @@ case "$cmd" in
     kv "run"      "${B}full test${N}: 1 unicast (UpSnap) → 2 ARP pinned → 3 raw"
     kv "report"   "${B}all runs in one table${N} (the page to show)"
     kv "status"   "cable, ARP entry, how long the PC has been asleep"
-    kv "use"      "switch target only, do this before the PC goes to sleep"
+    kv "use"      "switch target only (optional: lets the Pi time the sleep)"
     kv "profiles" "list saved targets  ·  profile add <name> <ip/prefix> <mac>  ·  profile rm <name>"
     kv "unicast"  "only shot 1   ·   static: only shot 2   ·   raw: only shot 3"
     kv "log [n]"  "detailed log with timestamps"

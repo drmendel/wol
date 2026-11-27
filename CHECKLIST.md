@@ -80,8 +80,9 @@ ssh <user>@<pi-ip>
 
 **Run**
 
-- [ ] `wol-test use <profile>`, Pi `eth0` cabled **directly** to the PC; wake the PC once so it gets its DHCP lease
-- [ ] Put the PC to sleep / shut it down for **1–2 hours** (`wol-test status` shows how long), LED still lit
+- [ ] PC asleep / shut down (for as long as it takes to fail with UpSnap, even days), LED still lit
+- [ ] Pi `eth0` cabled **directly** to the PC. The PC does **not** need to be switched on: IP and MAC come from the profile
+- [ ] Optional: `wol-test use <profile>` while the PC is still awake lets the Pi time the sleep (`wol-test status`)
 - [ ] `wol-test run <profile>` sends, in order, and stops at the first one that wakes the PC:
 
 | Shot | What is sent | Woke the PC → conclusion |
