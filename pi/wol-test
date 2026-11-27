@@ -1,0 +1,132 @@
+#!/bin/bash
+# wol-test: Wake-on-LAN isolation test (Raspberry Pi cabled directly to the PC on eth0)
+# Install with pi/setup.sh. Docs: CHECKLIST.md section 5.
+set -u
+[ -r /etc/wol-test.conf ] && . /etc/wol-test.conf
+MAC=${MAC:?set MAC in /etc/wol-test.conf (run pi/setup.sh)}
+MAC=$(tr 'A-F' 'a-f' <<<"$MAC")
+IP=${IP:-}                   # optional: if empty, the PC's IP is taken from the DHCP lease
+PORT=${PORT:-9}              # UDP port of the magic packet (UpSnap default: 9)
+IFACE=${IFACE:-eth0}
+WAIT=${WAIT:-120}            # seconds to wait for the PC to come up after each shot
+STATE=/var/lib/wol-test
+LOG=/var/log/wol-test.log
+PCAP=/var/log/wol-test
+
+[ "$(id -u)" -eq 0 ] || exec sudo -E "$0" "$@"
+mkdir -p "$STATE" "$PCAP"
+
+log() { echo "$(date '+%F %T') $*" | tee -a "$LOG"; }
+dur() { local s=$1; printf '%dh%02dm%02ds' $((s/3600)) $((s%3600/60)) $((s%60)); }
+
+# PC IP: configured > current DHCP lease for the MAC > last IP the monitor saw
+pc_ip() {
+  [ -n "$IP" ] && { echo "$IP"; return; }
+  local l; l=$(awk -v m="$MAC" 'tolower($2)==m {print $3}' /var/lib/NetworkManager/dnsmasq-"$IFACE".leases 2>/dev/null | tail -1)
+  [ -n "$l" ] && { echo "$l" > "$STATE/pc_ip"; echo "$l"; return; }
+  cat "$STATE/pc_ip" 2>/dev/null
+}
+need_ip() {
+  TARGET=$(pc_ip)
+  [ -n "$TARGET" ] && return
+  log "!! PC IP unknown: wake the PC once with the cable plugged in so it gets a DHCP lease (or set IP in /etc/wol-test.conf)."
+  exit 3
+}
+alive() { local t; t=$(pc_ip); [ -n "$t" ] && ping -c1 -W1 -I "$IFACE" "$t" >/dev/null 2>&1; }
+
+asleep_for() {
+  [ -s "$STATE/last_online" ] || { echo "unknown (not seen online since monitor start)"; return; }
+  echo "$(dur $(( $(date +%s) - $(cat "$STATE/last_online") )))"
+}
+
+# Wait until the PC shows signs of life: ping reply, or it sends DHCP/IP traffic.
+# ARP replies are ignored on purpose: NIC "ARP offload" can answer ARP while asleep.
+wait_wake() {
+  local end=$((SECONDS + WAIT))
+  while [ $SECONDS -lt $end ]; do
+    alive && return 0
+    timeout 3 tcpdump -i "$IFACE" -c1 -nn "ether src $MAC and (udp port 67 or icmp or tcp or ip6)" >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
+
+# Run a shot while capturing everything on eth0, then summarise what really hit the wire.
+shot() {
+  local name=$1; shift
+  local f="$PCAP/$(date +%Y%m%d-%H%M%S)-$name.pcap"
+  tcpdump -i "$IFACE" -nn -U -w "$f" 2>/dev/null & local tp=$!
+  sleep 1
+  log "[$name] neighbour entry before: $(ip neigh show "$TARGET" dev "$IFACE" | head -1 | sed 's/^$/none/')"
+  log "[$name] sending: $*"
+  "$@" >/dev/null 2>&1
+  sleep 4; kill $tp 2>/dev/null; wait $tp 2>/dev/null
+  local d arp udp raw
+  d=$(tcpdump -r "$f" -nn -e 2>/dev/null)
+  arp=$(grep -c "who-has $TARGET " <<<"$d"); udp=$(grep -c "> $TARGET.$PORT: UDP" <<<"$d"); raw=$(grep -ci "0x0842" <<<"$d")
+  log "[$name] on the wire: ARP who-has $TARGET x$arp | UDP magic to $TARGET:$PORT x$udp | raw 0x0842 x$raw  (pcap: $f)"
+  [ "$name" = unicast ] && [ "$udp" -eq 0 ] && log "[$name] >>> magic packet NEVER LEFT the Pi: ARP unresolved, the kernel dropped it"
+}
+
+send_unicast() { shot unicast wakeonlan -i "$TARGET" -p "$PORT" "$MAC"; }
+send_static()  {
+  ip neigh replace "$TARGET" lladdr "$MAC" dev "$IFACE" nud permanent
+  shot static-arp wakeonlan -i "$TARGET" -p "$PORT" "$MAC"
+  ip neigh del "$TARGET" dev "$IFACE" 2>/dev/null
+}
+send_raw()     { shot raw etherwake -i "$IFACE" "$MAC"; }
+
+try() {
+  local mode=$1
+  "send_$mode"
+  log "[$mode] waiting up to ${WAIT}s for the PC..."
+  if wait_wake; then log "[$mode] PC WOKE UP"; return 0; fi
+  log "[$mode] no wake"; return 1
+}
+
+check_link() {
+  if [ "$(cat /sys/class/net/"$IFACE"/carrier 2>/dev/null)" != 1 ]; then
+    log "!! $IFACE has NO LINK: cable unplugged or the PC's NIC is unpowered (BIOS ErP / Deep Sleep, CHECKLIST §1, §4)."
+    log "!! Nothing sent over the network can wake it in this state."
+    exit 2
+  fi
+}
+
+case "${1:-help}" in
+  status)
+    t=$(pc_ip)
+    echo "PC        : $MAC  ${t:-IP unknown} (UDP port $PORT)"
+    echo "$IFACE link : $( [ "$(cat /sys/class/net/"$IFACE"/carrier 2>/dev/null)" = 1 ] && echo "UP $(cat /sys/class/net/"$IFACE"/speed)Mb/s" || echo DOWN)"
+    echo "Pi $IFACE IP: $(ip -4 -br addr show "$IFACE" | awk '{print $3}')"
+    [ -n "$t" ] && echo "ARP entry : $(ip neigh show "$t" dev "$IFACE" | head -1)"
+    echo "PC state  : $(alive && echo AWAKE || echo "not responding, asleep for $(asleep_for)")"
+    echo "--- last log lines"; tail -n 8 "$LOG" 2>/dev/null ;;
+  run)          # the full experiment: UpSnap-style unicast first, then the controls
+    check_link; need_ip
+    log "===== WoL test run | PC $MAC @ $TARGET | asleep for: $(asleep_for) | link $(cat /sys/class/net/"$IFACE"/speed)Mb/s ====="
+    if alive; then log "PC is awake, put it to sleep / shut it down first."; exit 1; fi
+    if   try unicast; then log "RESULT: plain unicast (UpSnap-style) woke it after the sleep. PC is fine; no ARP problem on this path."
+    elif try static;  then log "RESULT: unicast FAILED, the same packet WOKE the PC once ARP was pinned. PC is fine; the expired ARP entry is the problem."
+    elif try raw;     then log "RESULT: only raw L2 etherwake woke it. PC is fine; the problem is on the UDP/ARP path."
+    else                   log "RESULT: nothing woke it over a direct cable with link up. The PC / BIOS / NIC config is the problem (CHECKLIST §1-§3)."
+    fi ;;
+  unicast|static|raw) check_link; need_ip; try "$1" ;;
+  monitor)      # systemd service: track when the PC goes to sleep / wakes up
+    prev=""
+    while true; do
+      if alive; then date +%s > "$STATE/last_online"; cur=AWAKE; else cur=ASLEEP; fi
+      [ "$cur" != "$prev" ] && log "[monitor] PC $(pc_ip) is now $cur"
+      prev=$cur; sleep 15
+    done ;;
+  log) tail -n "${2:-40}" "$LOG" ;;
+  *) cat <<EOF
+wol-test: Wake-on-LAN isolation test for $MAC on $IFACE (UDP port $PORT)
+  wol-test status    link state, PC IP, ARP entry, how long the PC has been asleep
+  wol-test run       FULL TEST: unicast (UpSnap-style) -> static-ARP unicast -> raw etherwake
+  wol-test unicast   only the UpSnap-style unicast UDP magic packet to the PC's IP
+  wol-test static    unicast with a pinned ARP entry (PC IP -> MAC)
+  wol-test raw       only raw layer-2 etherwake
+  wol-test log [n]   show the result log
+Config: /etc/wol-test.conf   Log: $LOG   Captures: $PCAP/
+EOF
+  ;;
+esac

@@ -60,25 +60,41 @@ Run [`check`](check) (read-only) and [`fix`](fix) (interactive) from an **admin 
 
 ## 5. Isolation test: Raspberry Pi with a direct cable
 
-This removes the corporate network from the picture. No switch is needed; the Pi 4 auto-crosses a normal Ethernet cable.
+This removes the corporate network from the picture. No switch is needed; the Pi 4 auto-crosses a normal Ethernet cable. Tooling: [`pi/`](pi).
+
+**Setup (once)**: the Pi joins your phone hotspot / Wi-Fi for SSH; `eth0` gets a DHCP server for the PC.
 
 ```bash
-sudo apt install etherwake wakeonlan
+git clone https://github.com/drmendel/wol && cd wol/pi
+sudo ./setup.sh AA:BB:CC:DD:EE:FF                # PC gets an automatic IP (read from the lease)
+sudo ./setup.sh AA:BB:CC:DD:EE:FF 192.168.50.4   # or: pin the PC's IP, Pi address is derived
 ```
 
-- [ ] Pi on **Wi-Fi** (for SSH), Pi `eth0` cabled **directly** to the PC
-- [ ] PC shut down for **1–2 hours**, LED still lit
-- [ ] Send both packet types:
-  ```bash
-  sudo etherwake -i eth0 AA:BB:CC:DD:EE:FF   # raw Ethernet (EtherType 0x0842)
-  sudo etherwake -b -i eth0 AA:BB:CC:DD:EE:FF # same, to broadcast address
-  wakeonlan AA:BB:CC:DD:EE:FF                 # UDP broadcast, port 9
-  ```
+**Find the Pi** from the laptop (on the same hotspot), whatever subnet the hotspot uses:
 
-| Result | Conclusion |
-|---|---|
-| ❌ Doesn't wake | **PC configuration** is still wrong → §1–§4 |
-| ✅ Wakes | PC is fine → the problem is the **network** → §6 |
+```bash
+nmap -p22 --open "$(ip -4 route show dev "$(ip route show default | awk '{print $5; exit}')" scope link | awk '{print $1; exit}')"
+ssh <user>@<pi-ip>
+```
+
+**Run**
+
+- [ ] Pi `eth0` cabled **directly** to the PC; wake the PC once so it gets its DHCP lease
+- [ ] Put the PC to sleep / shut it down for **1–2 hours** (`wol-test status` shows how long), LED still lit
+- [ ] `wol-test run` sends, in order, and stops at the first one that wakes the PC:
+
+| Shot | What is sent | Woke the PC → conclusion |
+|---|---|---|
+| `unicast` | UDP magic packet to the PC's IP (what UpSnap does) | PC fine, no ARP problem on this path |
+| `static` | same packet, ARP entry pinned (`ip neigh … nud permanent`) | **PC fine, expired ARP entry is the problem** → §8 |
+| `raw` | `etherwake`, raw Ethernet (EtherType 0x0842) | PC fine, problem is on the UDP/ARP path → §6–§8 |
+| none, link up | | **PC configuration** is still wrong → §1–§4 |
+
+> **Why three shots?** A sleeping PC doesn't answer ARP. Once the sender's ARP entry expires, a *unicast* magic packet never leaves the sender; the kernel drops it after the unanswered `who-has`. That happens on the Pi too, so a failed plain unicast alone doesn't prove the PC is at fault. Each shot logs the neighbour entry and a pcap of what actually went on the wire (`wol-test log`, `/var/log/wol-test/*.pcap`): bring that to the admin.
+
+If `eth0` has no link while the PC is off, `wol-test` stops: the NIC is unpowered (§1, §4) and no packet can help.
+
+> Before plugging the Pi into a real network (§6): `sudo nmcli con down wol-direct`, because it serves DHCP on `eth0`.
 
 ## 6. Same-VLAN test on the real network
 

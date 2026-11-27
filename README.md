@@ -27,4 +27,4 @@ irm "https://raw.githubusercontent.com/drmendel/wol/main/fix" | iex
 
 ## Still not waking?
 
-Follow the full [Troubleshooting Checklist](CHECKLIST.md): BIOS, Windows, NIC, physical checks, a Raspberry Pi isolation test, and switch/router settings for the network admin.
+Follow the full [Troubleshooting Checklist](CHECKLIST.md): BIOS, Windows, NIC, physical checks, a Raspberry Pi isolation test (automated with [`pi/setup.sh`](pi/setup.sh) + `wol-test run`), and switch/router settings for the network admin.
